@@ -18,7 +18,6 @@
  * limitations under the License.
  */
 
-#include "flow/actorcompiler.h"
 #include "ManagementAPI.h"
 
 #include "SystemData.h"
@@ -30,6 +29,7 @@
 #include "flow/UnitTest.h"
 #include "fdbrpc/ReplicationPolicy.h"
 #include "fdbrpc/Replication.h"
+#include "flow/actorcompiler.h"  // This must be the last #include.
 
 static Future<vector<AddressExclusion>> getExcludedServers( Transaction* const& tr );
 
@@ -65,14 +65,14 @@ std::map<std::string, std::string> configForToken( std::string const& mode ) {
 		std::string key = mode.substr(0, pos);
 		std::string value = mode.substr(pos+1);
 
-		if( (key == "logs" || key == "proxies" || key == "resolvers" || key == "remote_logs" || key == "satellite_logs" || key == "log_routers") && isInteger(value) ) {
+		if( (key == "logs" || key == "proxies" || key == "resolvers" || key == "remote_logs" || key == "log_routers" || key == "satellite_logs" || key == "usable_regions" || key == "repopulate_anti_quorum") && isInteger(value) ) {
 			out[p+key] = value;
 		}
 
 		if( key == "regions" ) {
 			json_spirit::mValue mv;
 			json_spirit::read_string( value, mv );
-			
+
 			StatusObject regionObj;
 			regionObj["regions"] = mv;
 			out[p+key] = BinaryWriter::toValue(regionObj, IncludeVersion()).toString();
@@ -123,6 +123,10 @@ std::map<std::string, std::string> configForToken( std::string const& mode ) {
 		tLogPolicy = IRepPolicyRef(new PolicyAcross(2, "dcid",
 			IRepPolicyRef(new PolicyAcross(2, "zoneid", IRepPolicyRef(new PolicyOne())))
 		));
+	} else if(mode == "three_datacenter_fallback") {
+		redundancy="4";
+		log_replicas="4";
+		storagePolicy = tLogPolicy = IRepPolicyRef(new PolicyAcross(2, "dcid", IRepPolicyRef(new PolicyAcross(2, "zoneid", IRepPolicyRef(new PolicyOne())))));
 	} else if(mode == "three_data_hall") {
 		redundancy="3";
 		log_replicas="4";
@@ -133,8 +137,7 @@ std::map<std::string, std::string> configForToken( std::string const& mode ) {
 	} else
 		redundancySpecified = false;
 	if (redundancySpecified) {
-		out[p+"storage_replicas"] =
-			out[p+"storage_quorum"] = redundancy;
+		out[p+"storage_replicas"] = redundancy;
 		out[p+"log_replicas"] = log_replicas;
 		out[p+"log_anti_quorum"] = "0";
 
@@ -151,7 +154,7 @@ std::map<std::string, std::string> configForToken( std::string const& mode ) {
 	std::string remote_redundancy, remote_log_replicas;
 	IRepPolicyRef remoteTLogPolicy;
 	bool remoteRedundancySpecified = true;
-	if (mode == "remote_none") {
+	if (mode == "remote_default") {
 		remote_redundancy="0";
 		remote_log_replicas="0";
 		remoteTLogPolicy = IRepPolicyRef();
@@ -192,13 +195,13 @@ ConfigurationResult::Type buildConfiguration( std::vector<StringRef> const& mode
 		std::string mode = it.toString();
 		auto m = configForToken( mode );
 		if( !m.size() ) {
-			TraceEvent(SevWarnAlways, "UnknownOption").detail("option", mode);
+			TraceEvent(SevWarnAlways, "UnknownOption").detail("Option", mode);
 			return ConfigurationResult::UNKNOWN_OPTION;
 		}
 
 		for( auto t = m.begin(); t != m.end(); ++t ) {
 			if( outConf.count( t->first ) ) {
-				TraceEvent(SevWarnAlways, "ConflictingOption").detail("option", printable(StringRef(t->first)));
+				TraceEvent(SevWarnAlways, "ConflictingOption").detail("Option", printable(StringRef(t->first)));
 				return ConfigurationResult::CONFLICTING_OPTIONS;
 			}
 			outConf[t->first] = t->second;
@@ -242,10 +245,25 @@ bool isCompleteConfiguration( std::map<std::string, std::string> const& options 
 
 	return 	options.count( p+"log_replicas" ) == 1 &&
 			options.count( p+"log_anti_quorum" ) == 1 &&
-			options.count( p+"storage_quorum" ) == 1 &&
 			options.count( p+"storage_replicas" ) == 1 &&
 			options.count( p+"log_engine" ) == 1 &&
 			options.count( p+"storage_engine" ) == 1;
+}
+
+ACTOR Future<DatabaseConfiguration> getDatabaseConfiguration( Database cx ) {
+	state Transaction tr(cx);
+	loop {
+		try {
+			tr.setOption(FDBTransactionOptions::LOCK_AWARE);
+			Standalone<RangeResultRef> res = wait( tr.getRange(configKeys, CLIENT_KNOBS->TOO_MANY) );
+			ASSERT( res.size() < CLIENT_KNOBS->TOO_MANY );
+			DatabaseConfiguration config;
+			config.fromKeyValues((VectorRef<KeyValueRef>) res);
+			return config;
+		} catch( Error &e ) {
+			wait( tr.onError(e) );
+		}
+	}
 }
 
 ACTOR Future<ConfigurationResult::Type> changeConfig( Database cx, std::map<std::string, std::string> m ) {
@@ -262,6 +280,19 @@ ACTOR Future<ConfigurationResult::Type> changeConfig( Database cx, std::map<std:
 		m[initIdKey.toString()] = g_random->randomUniqueID().toString();
 		if (!isCompleteConfiguration(m))
 			return ConfigurationResult::INCOMPLETE_CONFIGURATION;
+	} else {
+		state Future<DatabaseConfiguration> fConfig = getDatabaseConfiguration(cx);
+		wait( success(fConfig) || delay(1.0) );
+
+		if(fConfig.isReady()) {
+			DatabaseConfiguration config = fConfig.get();
+			for(auto kv : m) {
+				config.set(kv.first, kv.second);
+			}
+			if(!config.isValid()) {
+				return ConfigurationResult::INVALID_CONFIGURATION;
+			}
+		}
 	}
 
 	loop {
@@ -280,7 +311,7 @@ ACTOR Future<ConfigurationResult::Type> changeConfig( Database cx, std::map<std:
 			for(auto i=m.begin(); i!=m.end(); ++i)
 				tr.set( StringRef(i->first), StringRef(i->second) );
 
-			Void _ = wait( tr.commit() );
+			wait( tr.commit() );
 			break;
 		} catch (Error& e) {
 			state Error e1(e);
@@ -298,11 +329,11 @@ ACTOR Future<ConfigurationResult::Type> changeConfig( Database cx, std::map<std:
 						else
 							return ConfigurationResult::DATABASE_CREATED;
 					} catch (Error& e2) {
-						Void _ = wait( tr.onError(e2) );
+						wait( tr.onError(e2) );
 					}
 				}
 			}
-			Void _ = wait( tr.onError(e1) );
+			wait( tr.onError(e1) );
 		}
 	}
 	return ConfigurationResult::SUCCESS;
@@ -339,6 +370,9 @@ ConfigureAutoResult parseConfig( StatusObject const& status ) {
 		log_replication = 3;
 	} else if( result.old_replication == "three_datacenter" ) {
 		storage_replication = 6;
+		log_replication = 4;
+	} else if( result.old_replication == "three_datacenter_fallback" ) {
+		storage_replication = 4;
 		log_replication = 4;
 	} else
 		return ConfigureAutoResult();
@@ -592,10 +626,10 @@ ACTOR Future<ConfigurationResult::Type> autoConfig( Database cx, ConfigureAutoRe
 					tr.set(kv.first, kv.second);
 			}
 
-			Void _ = wait( tr.commit() );
+			wait( tr.commit() );
 			return ConfigurationResult::SUCCESS;
 		} catch( Error &e ) {
-			Void _ = wait( tr.onError(e));
+			wait( tr.onError(e));
 		}
 	}
 }
@@ -625,7 +659,7 @@ ACTOR Future<vector<ProcessData>> getWorkers( Transaction* tr ) {
 	state Future<Standalone<RangeResultRef>> processClasses = tr->getRange( processClassKeys, CLIENT_KNOBS->TOO_MANY );
 	state Future<Standalone<RangeResultRef>> processData = tr->getRange( workerListKeys, CLIENT_KNOBS->TOO_MANY );
 
-	Void _ = wait( success(processClasses) && success(processData) );
+	wait( success(processClasses) && success(processData) );
 	ASSERT( !processClasses.get().more && processClasses.get().size() < CLIENT_KNOBS->TOO_MANY );
 	ASSERT( !processData.get().more && processData.get().size() < CLIENT_KNOBS->TOO_MANY );
 
@@ -660,7 +694,7 @@ ACTOR Future<vector<ProcessData>> getWorkers( Database cx ) {
 			vector<ProcessData> workers = wait( getWorkers(&tr) );
 			return workers;
 		} catch (Error& e) {
-			Void _ = wait( tr.onError(e) );
+			wait( tr.onError(e) );
 		}
 	}
 }
@@ -676,7 +710,7 @@ ACTOR Future<std::vector<NetworkAddress>> getCoordinators( Database cx ) {
 
 			return ClusterConnectionString( currentKey.get().toString() ).coordinators();
 		} catch (Error& e) {
-			Void _ = wait( tr.onError(e) );
+			wait( tr.onError(e) );
 		}
 	}
 }
@@ -732,19 +766,19 @@ ACTOR Future<CoordinatorsResult::Type> changeQuorum( Database cx, Reference<IQuo
 				leaderServers.push_back( retryBrokenPromise( coord.clientLeaderServers[i].getLeader, GetLeaderRequest( coord.clusterKey, UID() ), TaskCoordinationReply ) );
 
 			choose {
-				when( Void _ = wait( waitForAll( leaderServers ) ) ) {}
-				when( Void _ = wait( delay(5.0) ) ) {
+				when( wait( waitForAll( leaderServers ) ) ) {}
+				when( wait( delay(5.0) ) ) {
 					return CoordinatorsResult::COORDINATOR_UNREACHABLE;
 				}
 			}
 
 			tr.set( coordinatorsKey, conn.toString() );
 
-			Void _ = wait( tr.commit() );
+			wait( tr.commit() );
 			ASSERT( false ); //commit should fail, but the value has changed
 		} catch (Error& e) {
 			TraceEvent("RetryQuorumChange").error(e).detail("Retries", retries);
-			Void _ = wait( tr.onError(e) );
+			wait( tr.onError(e) );
 			++retries;
 		}
 	}
@@ -792,7 +826,7 @@ struct AutoQuorumChange : IQuorumChange {
 	ACTOR static Future<int> getRedundancy( AutoQuorumChange* self, Transaction* tr ) {
 		state Future<Optional<Value>> fStorageReplicas = tr->get( LiteralStringRef("storage_replicas").withPrefix( configKeysPrefix ) );
 		state Future<Optional<Value>> fLogReplicas = tr->get( LiteralStringRef("log_replicas").withPrefix( configKeysPrefix ) );
-		Void _ = wait( success( fStorageReplicas ) && success( fLogReplicas ) );
+		wait( success( fStorageReplicas ) && success( fLogReplicas ) );
 		int redundancy = std::min(
 			atoi( fStorageReplicas.get().get().toString().c_str() ),
 			atoi( fLogReplicas.get().get().toString().c_str() ) );
@@ -973,10 +1007,10 @@ ACTOR Future<Void> excludeServers( Database cx, vector<AddressExclusion> servers
 
 			TraceEvent("ExcludeServersCommit").detail("Servers", describe(servers));
 
-			Void _ = wait( tr.commit() );
+			wait( tr.commit() );
 			return Void();
 		} catch (Error& e) {
-			Void _ = wait( tr.onError(e) );
+			wait( tr.onError(e) );
 		}
 	}
 }
@@ -1010,11 +1044,11 @@ ACTOR Future<Void> includeServers( Database cx, vector<AddressExclusion> servers
 
 			TraceEvent("IncludeServersCommit").detail("Servers", describe(servers));
 
-			Void _ = wait( tr.commit() );
+			wait( tr.commit() );
 			return Void();
 		} catch (Error& e) {
 			TraceEvent("IncludeServersError").error(e, true);
-			Void _ = wait( tr.onError(e) );
+			wait( tr.onError(e) );
 		}
 	}
 }
@@ -1044,10 +1078,10 @@ ACTOR Future<Void> setClass( Database cx, AddressExclusion server, ProcessClass 
 			if(foundChange)
 				tr.set(processClassChangeKey, g_random->randomUniqueID().toString());
 
-			Void _ = wait( tr.commit() );
+			wait( tr.commit() );
 			return Void();
 		} catch (Error& e) {
-			Void _ = wait( tr.onError(e) );
+			wait( tr.onError(e) );
 		}
 	}
 }
@@ -1075,7 +1109,7 @@ ACTOR Future<vector<AddressExclusion>> getExcludedServers( Database cx ) {
 			vector<AddressExclusion> exclusions = wait( getExcludedServers(&tr) );
 			return exclusions;
 		} catch (Error& e) {
-			Void _ = wait( tr.onError(e) );
+			wait( tr.onError(e) );
 		}
 	}
 }
@@ -1104,11 +1138,11 @@ ACTOR Future<int> setDDMode( Database cx, int mode ) {
 
 			tr.set( dataDistributionModeKey, wr.toStringRef() );
 
-			Void _ = wait( tr.commit() );
+			wait( tr.commit() );
 			return oldMode;
 		} catch (Error& e) {
-			TraceEvent("setDDModeRetrying").error(e);
-			Void _ = wait (tr.onError(e));
+			TraceEvent("SetDDModeRetrying").error(e);
+			wait (tr.onError(e));
 		}
 	}
 }
@@ -1160,9 +1194,48 @@ ACTOR Future<Void> waitForExcludedServers( Database cx, vector<AddressExclusion>
 
 			if (ok) return Void();
 
-			Void _ = wait( delayJittered( 1.0 ) );  // SOMEDAY: watches!
+			wait( delayJittered( 1.0 ) );  // SOMEDAY: watches!
 		} catch (Error& e) {
-			Void _ = wait( tr.onError(e) );
+			wait( tr.onError(e) );
+		}
+	}
+}
+
+ACTOR Future<Void> waitForFullReplication( Database cx ) {
+	state ReadYourWritesTransaction tr(cx);
+	loop {
+		try {
+			tr.setOption( FDBTransactionOptions::READ_SYSTEM_KEYS );
+			tr.setOption( FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE );
+			tr.setOption( FDBTransactionOptions::LOCK_AWARE );
+
+			Standalone<RangeResultRef> confResults = wait( tr.getRange(configKeys, CLIENT_KNOBS->TOO_MANY) );
+			ASSERT( !confResults.more && confResults.size() < CLIENT_KNOBS->TOO_MANY );
+			state DatabaseConfiguration config;
+			config.fromKeyValues((VectorRef<KeyValueRef>) confResults);
+			
+			state std::vector<Future<Optional<Value>>> replicasFutures;
+			for(auto& region : config.regions) {
+				replicasFutures.push_back(tr.get(datacenterReplicasKeyFor(region.dcId)));
+			}
+			wait( waitForAll(replicasFutures) );
+
+			state std::vector<Future<Void>> watchFutures;
+			for(int i = 0; i < config.regions.size(); i++) {
+				if( !replicasFutures[i].get().present() || decodeDatacenterReplicasValue(replicasFutures[i].get().get()) < config.storageTeamSize ) {
+					watchFutures.push_back(tr.watch(datacenterReplicasKeyFor(config.regions[i].dcId)));
+				}
+			}
+
+			if( !watchFutures.size() || (config.usableRegions == 1 && watchFutures.size() < config.regions.size())) {
+				return Void();
+			}
+
+			wait( tr.commit() );
+			wait( waitForAny(watchFutures) );
+			tr.reset();
+		} catch (Error& e) {
+			wait( tr.onError(e) );
 		}
 	}
 }
@@ -1174,10 +1247,10 @@ ACTOR Future<Void> timeKeeperSetDisable(Database cx) {
 			tr.setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
 			tr.setOption(FDBTransactionOptions::LOCK_AWARE);
 			tr.set(timeKeeperDisableKey, StringRef());
-			Void _ = wait(tr.commit());
+			wait(tr.commit());
 			return Void();
 		} catch (Error &e) {
-			Void _ = wait(tr.onError(e));
+			wait(tr.onError(e));
 		}
 	}
 }
@@ -1191,12 +1264,12 @@ ACTOR Future<Void> lockDatabase( Transaction* tr, UID id ) {
 		if(BinaryReader::fromStringRef<UID>(val.get().substr(10), Unversioned()) == id) {
 			return Void();
 		} else {
-			//TraceEvent("DBA_lock_locked").detail("expecting", id).detail("lock", BinaryReader::fromStringRef<UID>(val.get().substr(10), Unversioned()));
+			//TraceEvent("DBA_LockLocked").detail("Expecting", id).detail("Lock", BinaryReader::fromStringRef<UID>(val.get().substr(10), Unversioned()));
 			throw database_locked();
 		}
 	}
 
-	tr->atomicOp(databaseLockedKey, BinaryWriter::toValue(id, Unversioned()).withPrefix(LiteralStringRef("0123456789")), MutationRef::SetVersionstampedValue);
+	tr->atomicOp(databaseLockedKey, BinaryWriter::toValue(id, Unversioned()).withPrefix(LiteralStringRef("0123456789")).withSuffix(LiteralStringRef("\x00\x00\x00\x00")), MutationRef::SetVersionstampedValue);
 	tr->addWriteConflictRange(normalKeys);
 	return Void();
 }
@@ -1210,12 +1283,12 @@ ACTOR Future<Void> lockDatabase( Reference<ReadYourWritesTransaction> tr, UID id
 		if(BinaryReader::fromStringRef<UID>(val.get().substr(10), Unversioned()) == id) {
 			return Void();
 		} else {
-			//TraceEvent("DBA_lock_locked").detail("expecting", id).detail("lock", BinaryReader::fromStringRef<UID>(val.get().substr(10), Unversioned()));
+			//TraceEvent("DBA_LockLocked").detail("Expecting", id).detail("Lock", BinaryReader::fromStringRef<UID>(val.get().substr(10), Unversioned()));
 			throw database_locked();
 		}
 	}
 
-	tr->atomicOp(databaseLockedKey, BinaryWriter::toValue(id, Unversioned()).withPrefix(LiteralStringRef("0123456789")), MutationRef::SetVersionstampedValue);
+	tr->atomicOp(databaseLockedKey, BinaryWriter::toValue(id, Unversioned()).withPrefix(LiteralStringRef("0123456789")).withSuffix(LiteralStringRef("\x00\x00\x00\x00")), MutationRef::SetVersionstampedValue);
 	tr->addWriteConflictRange(normalKeys);
 	return Void();
 }
@@ -1224,13 +1297,13 @@ ACTOR Future<Void> lockDatabase( Database cx, UID id ) {
 	state Transaction tr(cx);
 	loop {
 		try {
-			Void _ = wait( lockDatabase(&tr, id) );
-			Void _ = wait( tr.commit() );
+			wait( lockDatabase(&tr, id) );
+			wait( tr.commit() );
 			return Void();
 		} catch( Error &e ) {
 			if(e.code() == error_code_database_locked)
 				throw e;
-			Void _ = wait( tr.onError(e) );
+			wait( tr.onError(e) );
 		}
 	}
 }
@@ -1244,7 +1317,7 @@ ACTOR Future<Void> unlockDatabase( Transaction* tr, UID id ) {
 		return Void();
 
 	if(val.present() && BinaryReader::fromStringRef<UID>(val.get().substr(10), Unversioned()) != id) {
-		//TraceEvent("DBA_unlock_locked").detail("expecting", id).detail("lock", BinaryReader::fromStringRef<UID>(val.get().substr(10), Unversioned()));
+		//TraceEvent("DBA_UnlockLocked").detail("Expecting", id).detail("Lock", BinaryReader::fromStringRef<UID>(val.get().substr(10), Unversioned()));
 		throw database_locked();
 	}
 
@@ -1261,7 +1334,7 @@ ACTOR Future<Void> unlockDatabase( Reference<ReadYourWritesTransaction> tr, UID 
 		return Void();
 
 	if(val.present() && BinaryReader::fromStringRef<UID>(val.get().substr(10), Unversioned()) != id) {
-		//TraceEvent("DBA_unlock_locked").detail("expecting", id).detail("lock", BinaryReader::fromStringRef<UID>(val.get().substr(10), Unversioned()));
+		//TraceEvent("DBA_UnlockLocked").detail("Expecting", id).detail("Lock", BinaryReader::fromStringRef<UID>(val.get().substr(10), Unversioned()));
 		throw database_locked();
 	}
 
@@ -1273,13 +1346,13 @@ ACTOR Future<Void> unlockDatabase( Database cx, UID id ) {
 	state Transaction tr(cx);
 	loop {
 		try {
-			Void _ = wait( unlockDatabase(&tr, id) );
-			Void _ = wait( tr.commit() );
+			wait( unlockDatabase(&tr, id) );
+			wait( tr.commit() );
 			return Void();
 		} catch( Error &e ) {
 			if(e.code() == error_code_database_locked)
 				throw e;
-			Void _ = wait( tr.onError(e) );
+			wait( tr.onError(e) );
 		}
 	}
 }
@@ -1290,7 +1363,7 @@ ACTOR Future<Void> checkDatabaseLock( Transaction* tr, UID id ) {
 	Optional<Value> val = wait( tr->get(databaseLockedKey) );
 
 	if (val.present() && BinaryReader::fromStringRef<UID>(val.get().substr(10), Unversioned()) != id) {
-		//TraceEvent("DBA_check_locked").detail("expecting", id).detail("lock", BinaryReader::fromStringRef<UID>(val.get().substr(10), Unversioned())).backtrace();
+		//TraceEvent("DBA_CheckLocked").detail("Expecting", id).detail("Lock", BinaryReader::fromStringRef<UID>(val.get().substr(10), Unversioned())).backtrace();
 		throw database_locked();
 	}
 
@@ -1303,15 +1376,163 @@ ACTOR Future<Void> checkDatabaseLock( Reference<ReadYourWritesTransaction> tr, U
 	Optional<Value> val = wait( tr->get(databaseLockedKey) );
 
 	if (val.present() && BinaryReader::fromStringRef<UID>(val.get().substr(10), Unversioned()) != id) {
-		//TraceEvent("DBA_check_locked").detail("expecting", id).detail("lock", BinaryReader::fromStringRef<UID>(val.get().substr(10), Unversioned())).backtrace();
+		//TraceEvent("DBA_CheckLocked").detail("Expecting", id).detail("Lock", BinaryReader::fromStringRef<UID>(val.get().substr(10), Unversioned())).backtrace();
 		throw database_locked();
 	}
 
 	return Void();
 }
 
+ACTOR Future<Void> forceRecovery (Reference<ClusterConnectionFile> clusterFile) {
+	state Reference<AsyncVar<Optional<ClusterInterface>>> clusterInterface(new AsyncVar<Optional<ClusterInterface>>);
+	state Future<Void> leaderMon = monitorLeader<ClusterInterface>(clusterFile, clusterInterface);
+
+	loop{
+		choose {
+			when( wait( clusterInterface->get().present() ? brokenPromiseToNever( clusterInterface->get().get().forceRecovery.getReply( ForceRecoveryRequest() ) ) : Never() ) ) {
+				return Void();
+			}
+			when( wait(clusterInterface->onChange()) ) {}
+		}
+	}
+}
+
+json_spirit::Value_type normJSONType(json_spirit::Value_type type) {
+	if (type == json_spirit::int_type)
+		return json_spirit::real_type;
+	return type;
+}
+
+void schemaCoverage( std::string const& spath, bool covered ) {
+	static std::set<std::string> coveredSchemaPaths;
+	if (coveredSchemaPaths.insert(spath).second) {
+		TraceEvent ev(SevInfo, "CodeCoverage");
+		ev.detail("File", "documentation/StatusSchema.json/" + spath).detail("Line", 0);
+		if (!covered)
+			ev.detail("Covered", 0);
+	}
+}
+
+bool schemaMatch( StatusObject const schema, StatusObject const result, std::string& errorStr, Severity sev, bool checkCoverage, std::string path, std::string schema_path ) {
+	// Returns true if everything in `result` is permitted by `schema`
+
+	// Really this should recurse on "values" rather than "objects"?
+
+	bool ok = true;
+
+	try {
+		for(auto& rkv : result) {
+			auto& key = rkv.first;
+			auto& rv = rkv.second;
+			std::string kpath = path + "." + key;
+			std::string spath = schema_path + "." + key;
+
+			if(checkCoverage) schemaCoverage(spath);
+
+			if (!schema.count(key)) {
+				errorStr += format("ERROR: Unknown key `%s'\n", kpath.c_str());
+				TraceEvent(sev, "SchemaMismatch").detail("Path", kpath).detail("SchemaPath", spath);
+				ok = false;
+				continue;
+			}
+			auto& sv = schema.at(key);
+
+			if (sv.type() == json_spirit::obj_type && sv.get_obj().count("$enum")) {
+				auto& enum_values = sv.get_obj().at("$enum").get_array();
+
+				bool any_match = false;
+				for(auto& enum_item : enum_values)
+					if (enum_item == rv) {
+						any_match = true;
+						if(checkCoverage) schemaCoverage(spath + ".$enum." + enum_item.get_str());
+						break;
+					}
+				if (!any_match) {
+					errorStr += format("ERROR: Unknown value `%s' for key `%s'\n", json_spirit::write_string(rv).c_str(), kpath.c_str());
+					TraceEvent(sev, "SchemaMismatch").detail("Path", kpath).detail("SchemaEnumItems", enum_values.size()).detail("Value", json_spirit::write_string(rv));
+					if(checkCoverage) schemaCoverage(spath + ".$enum." + json_spirit::write_string(rv));
+					ok = false;
+				}
+			} else if (sv.type() == json_spirit::obj_type && sv.get_obj().count("$map")) {
+				if (rv.type() != json_spirit::obj_type) {
+					errorStr += format("ERROR: Expected an object as the value for key `%s'\n", kpath.c_str());
+					TraceEvent(sev, "SchemaMismatch").detail("Path", kpath).detail("SchemaType", sv.type()).detail("ValueType", rv.type());
+					ok = false;
+					continue;
+				}
+				if(sv.get_obj().at("$map").type() != json_spirit::obj_type) {
+					continue;
+				}
+				auto& schema_obj = sv.get_obj().at("$map").get_obj();
+				auto& value_obj = rv.get_obj();
+
+				if(checkCoverage) schemaCoverage(spath + ".$map");
+
+				for(auto& value_pair : value_obj) {
+					auto vpath = kpath + "[" + value_pair.first + "]";
+					auto upath = spath + ".$map";
+					if (value_pair.second.type() != json_spirit::obj_type) {
+						errorStr += format("ERROR: Expected an object for `%s'\n", vpath.c_str());
+						TraceEvent(sev, "SchemaMismatch").detail("Path", vpath).detail("ValueType", value_pair.second.type());
+						ok = false;
+						continue;
+					}
+					if (!schemaMatch(schema_obj, value_pair.second.get_obj(), errorStr, sev, checkCoverage, vpath, upath))
+						ok = false;
+				}
+			} else {
+				// The schema entry isn't an operator, so it asserts a type and (depending on the type) recursive schema definition
+				if (normJSONType(sv.type()) != normJSONType(rv.type())) {
+					errorStr += format("ERROR: Incorrect value type for key `%s'\n", kpath.c_str());
+					TraceEvent(sev, "SchemaMismatch").detail("Path", kpath).detail("SchemaType", sv.type()).detail("ValueType", rv.type());
+					ok = false;
+					continue;
+				}
+				if (rv.type() == json_spirit::array_type) {
+					auto& value_array = rv.get_array();
+					auto& schema_array = sv.get_array();
+					if (!schema_array.size()) {
+						// An empty schema array means that the value array is required to be empty
+						if (value_array.size()) {
+							errorStr += format("ERROR: Expected an empty array for key `%s'\n", kpath.c_str());
+							TraceEvent(sev, "SchemaMismatch").detail("Path", kpath).detail("SchemaSize", schema_array.size()).detail("ValueSize", value_array.size());
+							ok = false;
+							continue;
+						}
+					} else if (schema_array.size() == 1 && schema_array[0].type() == json_spirit::obj_type) {
+						// A one item schema array means that all items in the value must match the first item in the schema
+						auto& schema_obj = schema_array[0].get_obj();
+						int index = 0;
+						for(auto &value_item : value_array) {
+							if (value_item.type() != json_spirit::obj_type) {
+								errorStr += format("ERROR: Expected all array elements to be objects for key `%s'\n", kpath.c_str());
+								TraceEvent(sev, "SchemaMismatch").detail("Path", kpath + format("[%d]",index)).detail("ValueType", value_item.type());
+								ok = false;
+								continue;
+							}
+							if (!schemaMatch(schema_obj, value_item.get_obj(), errorStr, sev, checkCoverage, kpath + format("[%d]", index), spath + "[0]"))
+								ok = false;
+							index++;
+						}
+					} else
+						ASSERT(false);  // Schema doesn't make sense
+				} else if (rv.type() == json_spirit::obj_type) {
+					auto& schema_obj = sv.get_obj();
+					auto& value_obj = rv.get_obj();
+					if (!schemaMatch(schema_obj, value_obj, errorStr, sev, checkCoverage, kpath, spath))
+						ok = false;
+				}
+			}
+		}
+		return ok;
+	} catch (std::exception& e) {
+		TraceEvent(SevError, "SchemaMatchException").detail("What", e.what()).detail("Path", path).detail("SchemaPath", schema_path);
+		throw unknown_error();
+	}
+}
+
 TEST_CASE("ManagementAPI/AutoQuorumChange/checkLocality") {
-	Void _ = wait(Future<Void>(Void()));
+	wait(Future<Void>(Void()));
 
 	std::vector<ProcessData> workers;
 	std::vector<NetworkAddress> chosen;

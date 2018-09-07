@@ -27,6 +27,7 @@
 #include "Status.h"
 #include "ClientDBInfo.h"
 #include "ClientWorkerInterface.h"
+#include "flow/JsonString.h"
 
 struct ClusterInterface {
 	RequestStream< struct OpenDatabaseRequest > openDatabase;
@@ -34,6 +35,7 @@ struct ClusterInterface {
 	RequestStream< struct StatusRequest > databaseStatus;
 	RequestStream< ReplyPromise<Void> > ping;
 	RequestStream< struct GetClientWorkersRequest > getClientWorkers;
+	RequestStream< struct ForceRecoveryRequest > forceRecovery;
 
 	bool operator == (ClusterInterface const& r) const { return id() == r.id(); }
 	bool operator != (ClusterInterface const& r) const { return id() != r.id(); }
@@ -46,11 +48,12 @@ struct ClusterInterface {
 		databaseStatus.getEndpoint( TaskClusterController );
 		ping.getEndpoint( TaskClusterController );
 		getClientWorkers.getEndpoint( TaskClusterController );
+		forceRecovery.getEndpoint( TaskClusterController );
 	}
 
 	template <class Ar>
 	void serialize( Ar& ar ) {
-		ar & openDatabase & failureMonitoring & databaseStatus & ping & getClientWorkers;
+		ar & openDatabase & failureMonitoring & databaseStatus & ping & getClientWorkers & forceRecovery;
 	}
 };
 
@@ -115,7 +118,7 @@ struct OpenDatabaseRequest {
 	//   info changes.  Returns immediately if the current client info id is different from
 	//   knownClientInfoID; otherwise returns when it next changes (or perhaps after a long interval)
 	Arena arena;
-	StringRef dbName, issues, traceLogGroup;
+	StringRef issues, traceLogGroup;
 	VectorRef<ClientVersionRef> supportedVersions;
 	UID knownClientInfoID;
 	ReplyPromise< struct ClientDBInfo > reply;
@@ -123,7 +126,7 @@ struct OpenDatabaseRequest {
 	template <class Ar>
 	void serialize(Ar& ar) {
 		ASSERT( ar.protocolVersion() >= 0x0FDB00A400040001LL );
-		ar & dbName & issues & supportedVersions & traceLogGroup & knownClientInfoID & reply & arena;
+		ar & issues & supportedVersions & traceLogGroup & knownClientInfoID & reply & arena;
 	}
 };
 
@@ -143,7 +146,7 @@ struct SystemFailureStatus {
 struct FailureMonitoringRequest {
 	// Sent by all participants to the cluster controller reply.clientRequestIntervalMS
 	//   ms after receiving the previous reply.
-	// Provides the controller the self-diagnosed status of the sender, and also 
+	// Provides the controller the self-diagnosed status of the sender, and also
 	//   requests the status of other systems.  Failure to timely send one of these implies
 	//   a failed status.
 	// If !senderStatus.present(), the sender wants to receive the latest failure information
@@ -186,13 +189,20 @@ struct StatusRequest {
 
 struct StatusReply {
 	StatusObject statusObj;
+	std::string statusStr;
 
 	StatusReply() {}
-	StatusReply( StatusObject statusObj ) : statusObj(statusObj) {}
+	explicit StatusReply(StatusObject obj) : statusObj(obj), statusStr(json_spirit::write_string(json_spirit::mValue(obj))) {}
+	explicit StatusReply(JsonString obj) : statusStr(obj.getJson()) {}
 
 	template <class Ar>
 	void serialize(Ar& ar) {
-		ar & statusObj;
+		ar & statusStr;
+		if( ar.isDeserializing ) {
+			json_spirit::mValue mv;
+			json_spirit::read_string( statusStr, mv );
+			statusObj = StatusObject(mv.get_obj());
+		}
 	}
 };
 
@@ -200,6 +210,17 @@ struct GetClientWorkersRequest {
 	ReplyPromise<vector<ClientWorkerInterface>> reply;
 
 	GetClientWorkersRequest() {}
+
+	template <class Ar>
+	void serialize(Ar& ar) {
+		ar & reply;
+	}
+};
+
+struct ForceRecoveryRequest {
+	ReplyPromise<Void> reply;
+
+	ForceRecoveryRequest() {}
 
 	template <class Ar>
 	void serialize(Ar& ar) {

@@ -18,7 +18,6 @@
  * limitations under the License.
  */
 
-#include "flow/actorcompiler.h"
 #include "fdbrpc/simulator.h"
 #include "flow/DeterministicRandom.h"
 #include "fdbrpc/PerfMetric.h"
@@ -38,6 +37,7 @@
 #include "IKeyValueStore.h"
 #include <stdarg.h>
 #include <stdio.h>
+#include <fstream>
 #include "pubsub.h"
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -72,6 +72,7 @@
 #endif
 
 #include "flow/SimpleOpt.h"
+#include "flow/actorcompiler.h"  // This must be the last #include.
 
 enum {
 	OPT_CONNFILE, OPT_SEEDCONNFILE, OPT_SEEDCONNSTRING, OPT_ROLE, OPT_LISTEN, OPT_PUBLICADDR, OPT_DATAFOLDER, OPT_LOGFOLDER, OPT_PARENTPID, OPT_NEWCONSOLE, OPT_NOBOX, OPT_TESTFILE, OPT_RESTARTING, OPT_RANDOMSEED, OPT_KEY, OPT_MEMLIMIT, OPT_STORAGEMEMLIMIT, OPT_MACHINEID, OPT_DCID, OPT_MACHINE_CLASS, OPT_BUGGIFY, OPT_VERSION, OPT_CRASHONERROR, OPT_HELP, OPT_NETWORKIMPL, OPT_NOBUFSTDOUT, OPT_BUFSTDOUTERR, OPT_TRACECLOCK, OPT_NUMTESTERS, OPT_DEVHELP, OPT_ROLLSIZE, OPT_MAXLOGS, OPT_MAXLOGSSIZE, OPT_KNOB, OPT_TESTSERVERS, OPT_TEST_ON_SERVERS, OPT_METRICSCONNFILE, OPT_METRICSPREFIX,
@@ -150,7 +151,9 @@ CSimpleOpt::SOption g_rgOptions[] = {
 	{ OPT_IO_TRUST_SECONDS,     "--io_trust_seconds",          SO_REQ_SEP },
 	{ OPT_IO_TRUST_WARN_ONLY,   "--io_trust_warn_only",        SO_NONE },
 
+#ifndef TLS_DISABLED
 	TLS_OPTION_FLAGS
+#endif
 
 	SO_END_OF_OPTIONS
 };
@@ -243,75 +246,6 @@ bool debugKeyRange( const char* context, Version version, KeyRangeRef const& key
 bool debugMutation( const char* context, Version version, MutationRef const& mutation ) { return false; }
 bool debugKeyRange( const char* context, Version version, KeyRangeRef const& keys ) { return false; }
 #endif
-
-Future<Void> debugQueryServer( DebugQueryRequest const& req ) {
-	Standalone<VectorRef<DebugEntryRef>> reply;
-
-	for(auto v = debugEntries.begin(); v != debugEntries.end(); ++v)
-		for(auto m = v->begin(); m != v->end(); ++m) {
-			if (m->mutation.type == m->mutation.ClearRange || m->mutation.type == m->mutation.DebugKeyRange) {
-				if (!KeyRangeRef(m->mutation.param1, m->mutation.param2).contains( req.search ))
-					continue;
-			} else if (m->mutation.type == m->mutation.SetValue) {
-				if (m->mutation.param1 != req.search)
-					continue;
-			}
-			reply.push_back( reply.arena(), *m );
-		}
-
-	req.reply.send(reply);
-	return Void();
-}
-
-auto sortByTime = [](DebugEntryRef const& a, DebugEntryRef const& b) { return a.time < b.time; };
-
-/*ACTOR Future<Void> debugSearchMutationCluster( ZookeeperInterface zk, Key key ) {
-	state ZKWatch<ClusterControllerFullInterface> ccWatch(zk, LiteralStringRef("ClusterController"));
-	state ClusterControllerFullInterface cc = wait( ccWatch.get() );
-
-	ASSERT( ccWatch.getLastVersion() );
-
-	Optional<vector<WorkerInterface>> workerList = wait( cc.getWorkers.tryGetReply( GetWorkersRequest() ) );
-	if( !workerList.present() ) {
-		printf("ERROR: CC interface not in ZK\n");
-		return Void();
-	}
-	state vector<WorkerInterface> workers = workerList.get();
-
-	state vector<Future<Standalone<VectorRef<DebugEntryRef>>>> replies( workers.size() );
-	for(int w=0; w<workers.size(); w++) {
-		DebugQueryRequest req;
-		req.search = key;
-		replies[w] = timeoutError(workers[w].debugQuery.getReply( req ), 5.0);
-	}
-	//state vector<Standalone<VectorRef<DebugEntryRef>>> result = wait( getAll( replies ) );
-	Void _ = wait(waitForAllReady( replies ));
-	state vector<Standalone<VectorRef<DebugEntryRef>>> result( workers.size() );
-	for(int r=0; r<result.size(); r++) {
-		if (replies[r].isError())
-			printf("ERROR: Couldn't get results from '%s'\n", workers[r].debugQuery.getEndpoint().address.toString().c_str());
-		else
-			result[r] = replies[r].get();
-	}
-	ASSERT( result.size() == workers.size() );
-
-	Standalone<VectorRef<DebugEntryRef>> all;
-	for(int r=0; r<result.size(); r++)
-		all.append( all.arena(), &result[r][0], result[r].size() );
-	std::sort( all.begin(), all.end(), sortByTime );
-	printf("\n\n");
-	for(auto e = all.begin(); e != all.end(); ++e) {
-		const char* type =
-			e->mutation.type == MutationRef::SetValue ? "SetValue" :
-			e->mutation.type == MutationRef::ClearRange ? "ClearRange" :
-			e->mutation.type == MutationRef::DebugKeyRange ? "DebugKeyRange" :
-			"UnknownMutation";
-		printf("%.6f\t%s\t%s\t%lld\t%s\t%s\t%s\n", e->time, e->address.toString().c_str(), e->context.toString().c_str(), e->version, type, printable(e->mutation.param1).c_str(), printable(e->mutation.param2).c_str());
-	}
-	printf("\n\n");
-
-	return Void();
-}*/
 
 #ifdef _WIN32
 #include <sddl.h>
@@ -414,7 +348,7 @@ UID getSharedMemoryMachineId() {
 
 
 ACTOR void failAfter( Future<Void> trigger, ISimulator::ProcessInfo* m = g_simulator.getCurrentProcess() ) {
-	Void _ = wait( trigger );
+	wait( trigger );
 	if (enableFailures) {
 		printf("Killing machine: %s at %f\n", m->address.toString().c_str(), now());
 		g_simulator.killProcess( m, ISimulator::KillInstantly );
@@ -533,11 +467,11 @@ ACTOR Future<Void> dumpDatabase( Database cx, std::string outputFilename, KeyRan
 				return Void();
 			} catch (Error& e) {
 				fclose(output);
-				Void _ = wait( tr.onError(e) );
+				wait( tr.onError(e) );
 			}
 		}
 	} catch (Error& e) {
-		TraceEvent(SevError,"dumpDatabaseError").error(e).detail("Filename", outputFilename);
+		TraceEvent(SevError,"DumpDatabaseError").error(e).detail("Filename", outputFilename);
 		throw;
 	}
 }
@@ -626,7 +560,9 @@ static void printUsage( const char *name, bool devhelp ) {
 		   "                 Machine class (valid options are storage, transaction,\n"
 		   "                 resolution, proxy, master, test, unset, stateless, log, router,\n"
 		   "                 and cluster_controller).\n");
+#ifndef TLS_DISABLED
 	printf(TLS_HELP);
+#endif
 	printf("  -v, --version  Print version information and exit.\n");
 	printf("  -h, -?, --help Display this help and exit.\n");
 	if( devhelp ) {
@@ -812,7 +748,7 @@ int main(int argc, char* argv[]) {
 
 		//Enables profiling on this thread (but does not start it)
 		registerThreadForProfiling();
-		
+
 		std::string commandLine;
 		for (int a = 0; a<argc; a++) {
 			if (a) commandLine += ' ';
@@ -848,7 +784,7 @@ int main(int argc, char* argv[]) {
 		std::string testServersStr;
 		NetworkAddress publicAddress, listenAddress;
 		const char *targetKey = NULL;
-		uint64_t memLimit = 8LL << 30;
+		uint64_t memLimit = 8LL << 30; // Nice to maintain the same default value for memLimit and SERVER_KNOBS->SERVER_MEM_LIMIT and SERVER_KNOBS->COMMIT_BATCHES_MEM_BYTES_HARD_LIMIT
 		uint64_t storageMemLimit = 1LL << 30;
 		bool buggifyEnabled = false, machineIdOverride = false, restarting = false;
 		Optional<Standalone<StringRef>> zoneId;
@@ -867,7 +803,8 @@ int main(int argc, char* argv[]) {
 		bool testOnServers = false;
 
 		Reference<TLSOptions> tlsOptions = Reference<TLSOptions>( new TLSOptions );
-		std::string tlsCertPath, tlsKeyPath, tlsVerifyPeers;
+		std::string tlsCertPath, tlsKeyPath, tlsCAPath, tlsPassword;
+		std::vector<std::string> tlsVerifyPeers;
 		double fileIoTimeout = 0.0;
 		bool fileIoWarnOnly = false;
 
@@ -1189,24 +1126,26 @@ int main(int argc, char* argv[]) {
 				case OPT_IO_TRUST_WARN_ONLY:
 					fileIoWarnOnly = true;
 					break;
+#ifndef TLS_DISABLED
 				case TLSOptions::OPT_TLS_PLUGIN:
-					try {
-						tlsOptions->set_plugin_name_or_path( args.OptionArg() );
-					} catch (Error& e) {
-						fprintf(stderr, "ERROR: cannot load TLS plugin `%s' (%s)\n", args.OptionArg(), e.what());
-						printHelpTeaser(argv[0]);
-						flushAndExit(FDB_EXIT_ERROR);
-					}
+					args.OptionArg();
 					break;
 				case TLSOptions::OPT_TLS_CERTIFICATES:
 					tlsCertPath = args.OptionArg();
+					break;
+				case TLSOptions::OPT_TLS_PASSWORD:
+					tlsPassword = args.OptionArg();
+					break;
+				case TLSOptions::OPT_TLS_CA_FILE:
+					tlsCAPath = args.OptionArg();
 					break;
 				case TLSOptions::OPT_TLS_KEY:
 					tlsKeyPath = args.OptionArg();
 					break;
 				case TLSOptions::OPT_TLS_VERIFY_PEERS:
-					tlsVerifyPeers = args.OptionArg();
+					tlsVerifyPeers.push_back(args.OptionArg());
 					break;
+#endif
 			}
 		}
 
@@ -1381,7 +1320,9 @@ int main(int argc, char* argv[]) {
 		CLIENT_KNOBS = clientKnobs;
 
 		if (!serverKnobs->setKnob( "log_directory", logFolder )) ASSERT(false);
-
+		if (role != Simulation) {
+			if (!serverKnobs->setKnob("commit_batches_mem_bytes_hard_limit", std::to_string(memLimit))) ASSERT(false);
+		}
 		for(auto k=knobs.begin(); k!=knobs.end(); ++k) {
 			try {
 				if (!flowKnobs->setKnob( k->first, k->second ) &&
@@ -1399,6 +1340,7 @@ int main(int argc, char* argv[]) {
 				throw;
 			}
 		}
+		if (!serverKnobs->setKnob("server_mem_limit", std::to_string(memLimit))) ASSERT(false);
 
 		if (role == SkipListTest) {
 			skipListTest();
@@ -1451,7 +1393,7 @@ int main(int argc, char* argv[]) {
 		// Initialize the thread pool
 		CoroThreadPool::init();
 		// Ordinarily, this is done when the network is run. However, network thread should be set before TraceEvents are logged. This thread will eventually run the network, so call it now.
-		TraceEvent::setNetworkThread(); 
+		TraceEvent::setNetworkThread();
 
 		if (role == Simulation || role == CreateTemplateDatabase) {
 			//startOldSimulator();
@@ -1463,22 +1405,29 @@ int main(int argc, char* argv[]) {
 
 			openTraceFile(publicAddress, rollsize, maxLogsSize, logFolder, "trace", logGroup);
 
+#ifndef TLS_DISABLED
 			if ( tlsCertPath.size() )
 				tlsOptions->set_cert_file( tlsCertPath );
-			if ( tlsKeyPath.size() )
-				tlsOptions->set_key_file( tlsKeyPath );
+			if (tlsCAPath.size())
+				tlsOptions->set_ca_file(tlsCAPath);
+			if (tlsKeyPath.size()) {
+				if (tlsPassword.size())
+					tlsOptions->set_key_password(tlsPassword);
+
+				tlsOptions->set_key_file(tlsKeyPath);
+			}
 			if ( tlsVerifyPeers.size() )
 				tlsOptions->set_verify_peers( tlsVerifyPeers );
 
 			tlsOptions->register_network();
-
+#endif
 			if (role == FDBD || role == NetworkTestServer) {
 				try {
 					listenError = FlowTransport::transport().bind(publicAddress, listenAddress);
 					if (listenError.isReady()) listenError.get();
 				} catch (Error& e) {
 					TraceEvent("BindError").error(e);
-					fprintf(stderr, "Error initializing networking with public address %s and listen address %s\n", publicAddress.toString().c_str(), listenAddress.toString().c_str());
+					fprintf(stderr, "Error initializing networking with public address %s and listen address %s (%s)\n", publicAddress.toString().c_str(), listenAddress.toString().c_str(), e.what());
 					printHelpTeaser(argv[0]);
 					flushAndExit(FDB_EXIT_ERROR);
 				}
@@ -1584,7 +1533,7 @@ int main(int argc, char* argv[]) {
 				platform::createDirectory( dataFolder );
 			}
 
-			setupAndRun( dataFolder, testFile, restarting );
+			setupAndRun( dataFolder, testFile, restarting, tlsOptions );
 			g_simulator.run();
 		} else if (role == FDBD) {
 			ASSERT( connectionFile );
@@ -1760,7 +1709,7 @@ int main(int argc, char* argv[]) {
 		flushAndExit(FDB_EXIT_MAIN_ERROR);
 	} catch (std::exception& e) {
 		fprintf(stderr, "std::exception: %s\n", e.what());
-		TraceEvent(SevError, "MainError").error(unknown_error()).detail("std::exception", e.what());
+		TraceEvent(SevError, "MainError").error(unknown_error()).detail("RootException", e.what());
 		//printf("\n%d tests passed; %d tests failed\n", passCount, failCount);
 		flushAndExit(FDB_EXIT_MAIN_EXCEPTION);
 	}

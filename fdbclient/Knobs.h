@@ -38,6 +38,8 @@ public:
 	double FAILURE_MIN_DELAY;
 	double FAILURE_TIMEOUT_DELAY;
 	double CLIENT_FAILURE_TIMEOUT_DELAY;
+	double FAILURE_EMERGENCY_DELAY;
+	double FAILURE_MAX_GENERATIONS;
 
 	// wrong_shard_server sometimes comes from the only nonfailed server, so we need to avoid a fast spin
 	double WRONG_SHARD_SERVER_DELAY; // SOMEDAY: This delay can limit performance of retrieving data when the cache is mostly wrong (e.g. dumping the database after a test)
@@ -46,6 +48,7 @@ public:
 	double DEFAULT_BACKOFF;
 	double DEFAULT_MAX_BACKOFF;
 	double BACKOFF_GROWTH_RATE;
+	double RESOURCE_CONSTRAINED_MAX_BACKOFF;
 
 	int64_t TRANSACTION_SIZE_LIMIT;
 	int64_t KEY_SIZE_LIMIT;
@@ -154,6 +157,10 @@ public:
 	int BLOBSTORE_REQUEST_TRIES;
 	int BLOBSTORE_REQUEST_TIMEOUT;
 	int BLOBSTORE_REQUESTS_PER_SECOND;
+	int BLOBSTORE_LIST_REQUESTS_PER_SECOND;
+	int BLOBSTORE_WRITE_REQUESTS_PER_SECOND;
+	int BLOBSTORE_READ_REQUESTS_PER_SECOND;
+	int BLOBSTORE_DELETE_REQUESTS_PER_SECOND;
 	int BLOBSTORE_CONCURRENT_REQUESTS;
 	int BLOBSTORE_MULTIPART_MAX_PART_SIZE;
 	int BLOBSTORE_MULTIPART_MIN_PART_SIZE;

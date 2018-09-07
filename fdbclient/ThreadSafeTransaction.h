@@ -33,7 +33,7 @@ class ThreadSafeCluster : public ICluster, public ThreadSafeReferenceCounted<Thr
 public:
 	static ThreadFuture<Reference<ICluster>> create( std::string connFilename, int apiVersion = -1 );
 	~ThreadSafeCluster();
-	ThreadFuture<Reference<IDatabase>> createDatabase( Standalone<StringRef> dbName );
+	ThreadFuture<Reference<IDatabase>> createDatabase();
 
 	void setOption( FDBClusterOptions::Option option, Optional<StringRef> value  = Optional<StringRef>() );
 
@@ -140,6 +140,8 @@ public:
 
 	ThreadFuture<Reference<ICluster>> createCluster(const char *clusterFilePath);
 
+	void addNetworkThreadCompletionHook(void (*hook)(void*), void *hookParameter);
+
 	static IClientApi* api;
 
 private:
@@ -148,6 +150,9 @@ private:
 	int apiVersion;
 	const std::string clientVersion;
 	uint64_t transportId;
+	
+	Mutex lock;
+	std::vector<std::pair<void (*)(void*), void*>> threadCompletionHooks;
 };
 
 #endif

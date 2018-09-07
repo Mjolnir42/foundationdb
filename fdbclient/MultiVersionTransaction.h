@@ -178,7 +178,7 @@ public:
 	DLCluster(Reference<FdbCApi> api, FdbCApi::FDBCluster *cluster) : api(api), cluster(cluster) {}
 	~DLCluster() { api->clusterDestroy(cluster); }
 
-	ThreadFuture<Reference<IDatabase>> createDatabase(Standalone<StringRef> dbName);
+	ThreadFuture<Reference<IDatabase>> createDatabase();
 	void setOption(FDBClusterOptions::Option option, Optional<StringRef> value = Optional<StringRef>());
 
 	void addref() { ThreadSafeReferenceCounted<DLCluster>::addref(); }
@@ -203,11 +203,16 @@ public:
 
 	ThreadFuture<Reference<ICluster>> createCluster(const char *clusterFilePath);
 
+	void addNetworkThreadCompletionHook(void (*hook)(void*), void *hookParameter);
+
 private:
 	const std::string fdbCPath;
 	const Reference<FdbCApi> api;
 	int headerVersion;
 	bool networkSetup;
+
+	Mutex lock;
+	std::vector<std::pair<void (*)(void*), void*>> threadCompletionHooks;
 
 	void init();
 };
@@ -273,7 +278,7 @@ class MultiVersionCluster;
 
 class MultiVersionDatabase : public IDatabase, ThreadSafeReferenceCounted<MultiVersionDatabase> {
 public:
-	MultiVersionDatabase(Reference<MultiVersionCluster> cluster, Standalone<StringRef> dbName, Reference<IDatabase> db, ThreadFuture<Void> changed);
+	MultiVersionDatabase(Reference<MultiVersionCluster> cluster, Reference<IDatabase> db, ThreadFuture<Void> changed);
 	~MultiVersionDatabase();
 
 	Reference<ITransaction> createTransaction();
@@ -286,7 +291,7 @@ public:
 
 private:
 	struct DatabaseState : ThreadCallback, ThreadSafeReferenceCounted<DatabaseState> {
-		DatabaseState(Reference<MultiVersionCluster> cluster, Standalone<StringRef> dbName, Reference<IDatabase> db, ThreadFuture<Void> changed);
+		DatabaseState(Reference<MultiVersionCluster> cluster, Reference<IDatabase> db, ThreadFuture<Void> changed);
 
 		void updateDatabase();
 		void cancelCallbacks();
@@ -299,7 +304,6 @@ private:
 
 		Reference<IDatabase> db;
 		const Reference<ThreadSafeAsyncVar<Reference<IDatabase>>> dbVar;
-		const Standalone<StringRef> dbName;
 
 		ThreadFuture<Reference<IDatabase>> dbFuture;
 		ThreadFuture<Void> changed;
@@ -338,7 +342,7 @@ public:
 	MultiVersionCluster(MultiVersionApi *api, std::string clusterFilePath, Reference<ICluster> cluster);
 	~MultiVersionCluster();
 
-	ThreadFuture<Reference<IDatabase>> createDatabase(Standalone<StringRef> dbName);
+	ThreadFuture<Reference<IDatabase>> createDatabase();
 	void setOption(FDBClusterOptions::Option option, Optional<StringRef> value = Optional<StringRef>());
 
 	void addref() { ThreadSafeReferenceCounted<MultiVersionCluster>::addref(); }
@@ -403,7 +407,7 @@ public:
 	void setupNetwork();
 	void runNetwork();
 	void stopNetwork();
-	void addNetworkThreadCompletionHook(void (*hook)(void*), void *hook_parameter);
+	void addNetworkThreadCompletionHook(void (*hook)(void*), void *hookParameter);
 
 	ThreadFuture<Reference<ICluster>> createCluster(const char *clusterFilePath);
 	static MultiVersionApi* api;
@@ -443,7 +447,6 @@ private:
 	std::vector<std::pair<FDBNetworkOptions::Option, Optional<Standalone<StringRef>>>> options;
 	std::map<FDBNetworkOptions::Option, std::set<Standalone<StringRef>>> setEnvOptions;
 	volatile bool envOptionsLoaded;
-	std::vector<std::pair<void (*)(void*), void*>> threadCompletionHooks;
 };
 
 

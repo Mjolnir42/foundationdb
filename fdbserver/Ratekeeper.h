@@ -24,13 +24,12 @@
 
 #include "MasterInterface.h"
 #include "TLogInterface.h"
-#include "DatabaseConfiguration.h"
+#include "fdbclient/DatabaseConfiguration.h"
 
 Future<Void> rateKeeper(
 	Reference<AsyncVar<struct ServerDBInfo>> const& dbInfo,
 	PromiseStream< std::pair<UID, Optional<StorageServerInterface>> > const& serverChanges,  // actually an input, but we don't want broken_promise
 	FutureStream< struct GetRateInfoRequest > const& getRateInfo,
-	Standalone<StringRef> const& dbName,
 	DatabaseConfiguration const& configuration,
 	double* const& lastLimited);
 
