@@ -18,23 +18,23 @@
  * limitations under the License.
  */
 
-#include "DatabaseContext.h"
-#include "NativeAPI.h"
-#include "Atomic.h"
+#include "fdbclient/DatabaseContext.h"
+#include "fdbclient/NativeAPI.h"
+#include "fdbclient/Atomic.h"
 #include "flow/Platform.h"
 #include "flow/ActorCollection.h"
-#include "SystemData.h"
+#include "fdbclient/SystemData.h"
 #include "fdbrpc/LoadBalance.h"
-#include "StorageServerInterface.h"
-#include "MasterProxyInterface.h"
-#include "ClusterInterface.h"
-#include "FailureMonitorClient.h"
+#include "fdbclient/StorageServerInterface.h"
+#include "fdbclient/MasterProxyInterface.h"
+#include "fdbclient/ClusterInterface.h"
+#include "fdbclient/FailureMonitorClient.h"
 #include "flow/DeterministicRandom.h"
-#include "KeyRangeMap.h"
+#include "fdbclient/KeyRangeMap.h"
 #include "flow/SystemMonitor.h"
-#include "MutationList.h"
-#include "CoordinationInterface.h"
-#include "MonitorLeader.h"
+#include "fdbclient/MutationList.h"
+#include "fdbclient/CoordinationInterface.h"
+#include "fdbclient/MonitorLeader.h"
 #include "fdbrpc/TLSConnection.h"
 #include "flow/Knobs.h"
 #include "fdbclient/Knobs.h"
@@ -73,38 +73,40 @@ static void initTLSOptions() {
 static const Key CLIENT_LATENCY_INFO_PREFIX = LiteralStringRef("client_latency/");
 static const Key CLIENT_LATENCY_INFO_CTR_PREFIX = LiteralStringRef("client_latency_counter/");
 
-Reference<LocationInfo> LocationInfo::getInterface( DatabaseContext *cx, std::vector<StorageServerInterface> const& alternatives, LocalityData const& clientLocality ) {
-	std::vector<UID> handles;
-	for( auto const& alternative : alternatives )
-		handles.push_back( alternative.getVersion.getEndpoint().token ); // getVersion here was a random choice
-	std::sort( handles.begin(), handles.end() );
-	ASSERT( handles.size() );
+Reference<StorageServerInfo> StorageServerInfo::getInterface( DatabaseContext *cx, StorageServerInterface const& ssi, LocalityData const& locality ) {
+	auto it = cx->server_interf.find( ssi.id() );
+	if( it != cx->server_interf.end() ) {
+		if(it->second->interf.getVersion.getEndpoint().token != ssi.getVersion.getEndpoint().token) {
+			if(it->second->interf.locality == ssi.locality) {
+				//FIXME: load balance holds pointers to individual members of the interface, and this assignment will swap out the object they are
+				//       pointing to. This is technically correct, but is very unnatural. We may want to refactor load balance to take an AsyncVar<Reference<Interface>>
+				//       so that it is notified when the interface changes.
+				it->second->interf = ssi;
+			} else {
+				it->second->notifyContextDestroyed();
+				Reference<StorageServerInfo> loc( new StorageServerInfo(cx, ssi, locality) );
+				cx->server_interf[ ssi.id() ] = loc.getPtr();
+				return loc;
+			}
+		}
 
-	auto it = cx->ssid_locationInfo.find( handles );
-	if( it != cx->ssid_locationInfo.end() ) {
-		return Reference<LocationInfo>::addRef( it->second );
+		return Reference<StorageServerInfo>::addRef( it->second );
 	}
 
-	Reference<LocationInfo> loc( new LocationInfo(cx, alternatives, clientLocality) );
-	cx->ssid_locationInfo[ handles ] = loc.getPtr();
+	Reference<StorageServerInfo> loc( new StorageServerInfo(cx, ssi, locality) );
+	cx->server_interf[ ssi.id() ] = loc.getPtr();
 	return loc;
 }
 
-void LocationInfo::notifyContextDestroyed() {
+void StorageServerInfo::notifyContextDestroyed() {
 	cx = NULL;
 }
 
-LocationInfo::~LocationInfo() {
+StorageServerInfo::~StorageServerInfo() {
 	if( cx ) {
-		std::vector<UID> handles;
-		for( auto const& alternative : getAlternatives() )
-			handles.push_back( alternative.v.getVersion.getEndpoint().token ); // must match above choice of UID
-		std::sort( handles.begin(), handles.end() );
-		ASSERT_ABORT( handles.size() );
-
-		auto it = cx->ssid_locationInfo.find( handles );
-		if( it != cx->ssid_locationInfo.end() )
-			cx->ssid_locationInfo.erase( it );
+		auto it = cx->server_interf.find( interf.id() );
+		if( it != cx->server_interf.end() )
+			cx->server_interf.erase( it );
 		cx = NULL;
 	}
 }
@@ -217,6 +219,7 @@ ACTOR Future<Void> databaseLogger( DatabaseContext *cx ) {
 	loop {
 		wait( delay( CLIENT_KNOBS->SYSTEM_MONITOR_INTERVAL, cx->taskID ) );
 		TraceEvent("TransactionMetrics")
+			.detail("Cluster", cx->cluster && cx->getConnectionFile() ? cx->getConnectionFile()->getConnectionString().clusterKeyName().toString() : "")
 			.detail("ReadVersions", cx->transactionReadVersions)
 			.detail("LogicalUncachedReads", cx->transactionLogicalReads)
 			.detail("PhysicalReadRequests", cx->transactionPhysicalReads)
@@ -472,16 +475,17 @@ ACTOR static Future<Void> monitorMasterProxiesChange(Reference<AsyncVar<ClientDB
 }
 
 DatabaseContext::DatabaseContext(
-	Reference<AsyncVar<ClientDBInfo>> clientInfo,
-	Reference<Cluster> cluster, Future<Void> clientInfoMonitor,
-	Standalone<StringRef> dbId, int taskID, LocalityData clientLocality, 
-	bool enableLocalityLoadBalance, bool lockAware )
-  : clientInfo(clientInfo), masterProxiesChangeTrigger(), cluster(cluster), clientInfoMonitor(clientInfoMonitor), dbId(dbId),
-	transactionReadVersions(0), transactionLogicalReads(0), transactionPhysicalReads(0), transactionCommittedMutations(0), transactionCommittedMutationBytes(0), transactionsCommitStarted(0),
-	transactionsCommitCompleted(0), transactionsTooOld(0), transactionsFutureVersions(0), transactionsNotCommitted(0), transactionsMaybeCommitted(0), transactionsResourceConstrained(0), taskID(taskID),
-	outstandingWatches(0), maxOutstandingWatches(CLIENT_KNOBS->DEFAULT_MAX_OUTSTANDING_WATCHES), clientLocality(clientLocality), enableLocalityLoadBalance(enableLocalityLoadBalance), lockAware(lockAware),
+	Reference<Cluster> cluster, Reference<AsyncVar<ClientDBInfo>> clientInfo, Future<Void> clientInfoMonitor, Standalone<StringRef> dbId, 
+	int taskID, LocalityData const& clientLocality, bool enableLocalityLoadBalance, bool lockAware, int apiVersion ) 
+	: cluster(cluster), clientInfo(clientInfo), clientInfoMonitor(clientInfoMonitor), dbId(dbId), taskID(taskID), clientLocality(clientLocality), enableLocalityLoadBalance(enableLocalityLoadBalance),
+	lockAware(lockAware), apiVersion(apiVersion),
+	transactionReadVersions(0), transactionLogicalReads(0), transactionPhysicalReads(0), transactionCommittedMutations(0), transactionCommittedMutationBytes(0), 
+	transactionsCommitStarted(0), transactionsCommitCompleted(0), transactionsTooOld(0), transactionsFutureVersions(0), transactionsNotCommitted(0), 
+	transactionsMaybeCommitted(0), transactionsResourceConstrained(0), outstandingWatches(0),
 	latencies(1000), readLatencies(1000), commitLatencies(1000), GRVLatencies(1000), mutationsPerCommit(1000), bytesPerCommit(1000)
 {
+	maxOutstandingWatches = CLIENT_KNOBS->DEFAULT_MAX_OUTSTANDING_WATCHES;
+
 	logger = databaseLogger( this );
 	locationCacheSize = g_network->isSimulated() ?
 			CLIENT_KNOBS->LOCATION_CACHE_EVICTION_SIZE_SIM :
@@ -496,6 +500,7 @@ DatabaseContext::DatabaseContext(
 
 ACTOR static Future<Void> monitorClientInfo( Reference<AsyncVar<Optional<ClusterInterface>>> clusterInterface, Reference<ClusterConnectionFile> ccf, Reference<AsyncVar<ClientDBInfo>> outInfo ) {
 	try {
+		state Optional<std::string> incorrectConnectionString;
 		loop {
 			OpenDatabaseRequest req;
 			req.knownClientInfoID = outInfo->get().id;
@@ -505,11 +510,18 @@ ACTOR static Future<Void> monitorClientInfo( Reference<AsyncVar<Optional<Cluster
 			ClusterConnectionString fileConnectionString;
 			if (ccf && !ccf->fileContentsUpToDate(fileConnectionString)) {
 				req.issues = LiteralStringRef("incorrect_cluster_file_contents");
+				std::string connectionString = ccf->getConnectionString().toString();
 				if(ccf->canGetFilename()) {
-					TraceEvent(SevWarnAlways, "IncorrectClusterFileContents").detail("Filename", ccf->getFilename())
+					// Don't log a SevWarnAlways the first time to account for transient issues (e.g. someone else changing the file right before us)
+					TraceEvent(incorrectConnectionString.present() && incorrectConnectionString.get() == connectionString ? SevWarnAlways : SevWarn, "IncorrectClusterFileContents")
+						.detail("Filename", ccf->getFilename())
 						.detail("ConnectionStringFromFile", fileConnectionString.toString())
-						.detail("CurrentConnectionString", ccf->getConnectionString().toString());
+						.detail("CurrentConnectionString", connectionString);
 				}
+				incorrectConnectionString = connectionString;
+			}
+			else {
+				incorrectConnectionString = Optional<std::string>();
 			}
 
 			choose {
@@ -533,22 +545,23 @@ ACTOR static Future<Void> monitorClientInfo( Reference<AsyncVar<Optional<Cluster
 	}
 }
 
-Future< Database > DatabaseContext::createDatabase( Reference<AsyncVar<Optional<ClusterInterface>>> clusterInterface, Reference<Cluster> cluster, LocalityData const& clientLocality ) {
-	Reference<AsyncVar<ClientDBInfo>> info( new AsyncVar<ClientDBInfo> );
-	Future<Void> monitor = monitorClientInfo( clusterInterface, cluster ? cluster->getConnectionFile() : Reference<ClusterConnectionFile>(), info );
+Database DatabaseContext::create(Reference<AsyncVar<Optional<ClusterInterface>>> clusterInterface, Reference<ClusterConnectionFile> connFile, LocalityData const& clientLocality) {
+	Reference<Cluster> cluster(new Cluster(connFile, clusterInterface));
+	Reference<AsyncVar<ClientDBInfo>> clientInfo(new AsyncVar<ClientDBInfo>());
+	Future<Void> clientInfoMonitor = monitorClientInfo(clusterInterface, connFile, clientInfo);
 
-	return std::move( Database( new DatabaseContext( info, cluster, monitor, LiteralStringRef(""), TaskDefaultEndpoint, clientLocality, true, false ) ) );
+	return Database(new DatabaseContext(cluster, clientInfo, clientInfoMonitor, LiteralStringRef(""), TaskDefaultEndpoint, clientLocality, true, false));
 }
 
-Database DatabaseContext::create( Reference<AsyncVar<ClientDBInfo>> info, Future<Void> dependency, LocalityData clientLocality, bool enableLocalityLoadBalance, int taskID, bool lockAware ) {
-	return Database( new DatabaseContext( info, Reference<Cluster>(), dependency, LiteralStringRef(""), taskID, clientLocality, enableLocalityLoadBalance, lockAware ) );
+Database DatabaseContext::create(Reference<AsyncVar<ClientDBInfo>> clientInfo, Future<Void> clientInfoMonitor, LocalityData clientLocality, bool enableLocalityLoadBalance, int taskID, bool lockAware, int apiVersion) {
+	return Database( new DatabaseContext( Reference<Cluster>(nullptr), clientInfo, clientInfoMonitor, LiteralStringRef(""), taskID, clientLocality, enableLocalityLoadBalance, lockAware, apiVersion ) );
 }
 
 DatabaseContext::~DatabaseContext() {
 	monitorMasterProxiesInfoChange.cancel();
-	for(auto it = ssid_locationInfo.begin(); it != ssid_locationInfo.end(); it = ssid_locationInfo.erase(it))
+	for(auto it = server_interf.begin(); it != server_interf.end(); it = server_interf.erase(it))
 		it->second->notifyContextDestroyed();
-	ASSERT_ABORT( ssid_locationInfo.empty() );
+	ASSERT_ABORT( server_interf.empty() );
 	locationCache.insert( allKeys, Reference<LocationInfo>() );
 }
 
@@ -594,8 +607,14 @@ bool DatabaseContext::getCachedLocations( const KeyRangeRef& range, vector<std::
 }
 
 Reference<LocationInfo> DatabaseContext::setCachedLocation( const KeyRangeRef& keys, const vector<StorageServerInterface>& servers ) {
+	vector<Reference<ReferencedInterface<StorageServerInterface>>> serverRefs;
+	serverRefs.reserve(servers.size());
+	for(auto& interf : servers) {
+		serverRefs.push_back( StorageServerInfo::getInterface( this, interf, clientLocality ) );
+	}
+
 	int maxEvictionAttempts = 100, attempts = 0;
-	Reference<LocationInfo> loc = LocationInfo::getInterface( this, servers, clientLocality);
+	Reference<LocationInfo> loc = Reference<LocationInfo>( new LocationInfo(serverRefs) );
 	while( locationCache.size() > locationCacheSize && attempts < maxEvictionAttempts) {
 		TEST( true ); // NativeAPI storage server locationCache entry evicted
 		attempts++;
@@ -654,8 +673,8 @@ void DatabaseContext::setOption( FDBDatabaseOptions::Option option, Optional<Str
 		case FDBDatabaseOptions::MACHINE_ID:
 			clientLocality = LocalityData( clientLocality.processId(), value.present() ? Standalone<StringRef>(value.get()) : Optional<Standalone<StringRef>>(), clientLocality.machineId(), clientLocality.dcId() );
 			if( clientInfo->get().proxies.size() )
-				masterProxies = Reference<ProxyInfo>( new ProxyInfo( clientInfo->get().proxies, clientLocality ));
-			ssid_locationInfo.clear();
+				masterProxies = Reference<ProxyInfo>( new ProxyInfo( clientInfo->get().proxies, clientLocality ) );
+			server_interf.clear();
 			locationCache.insert( allKeys, Reference<LocationInfo>() );
 			break;
 		case FDBDatabaseOptions::MAX_WATCHES:
@@ -665,7 +684,7 @@ void DatabaseContext::setOption( FDBDatabaseOptions::Option option, Optional<Str
 			clientLocality = LocalityData(clientLocality.processId(), clientLocality.zoneId(), clientLocality.machineId(), value.present() ? Standalone<StringRef>(value.get()) : Optional<Standalone<StringRef>>());
 			if( clientInfo->get().proxies.size() )
 				masterProxies = Reference<ProxyInfo>( new ProxyInfo( clientInfo->get().proxies, clientLocality ));
-			ssid_locationInfo.clear();
+			server_interf.clear();
 			locationCache.insert( allKeys, Reference<LocationInfo>() );
 			break;
 	}
@@ -683,64 +702,90 @@ void DatabaseContext::removeWatch() {
 	ASSERT(outstandingWatches >= 0);
 }
 
+Future<Void> DatabaseContext::onConnected() {
+	ASSERT(cluster);
+	return cluster->onConnected();
+}
+
+Reference<ClusterConnectionFile> DatabaseContext::getConnectionFile() {
+	ASSERT(cluster);
+	return cluster->getConnectionFile();
+}
+
+Database Database::createDatabase( Reference<ClusterConnectionFile> connFile, int apiVersion, LocalityData const& clientLocality ) {
+	Reference<Cluster> cluster(new Cluster(connFile, apiVersion));
+	Reference<AsyncVar<ClientDBInfo>> clientInfo(new AsyncVar<ClientDBInfo>());
+	Future<Void> clientInfoMonitor = monitorClientInfo(cluster->getClusterInterface(), connFile, clientInfo);
+
+	return Database( new DatabaseContext( cluster, clientInfo, clientInfoMonitor, LiteralStringRef(""), TaskDefaultEndpoint, clientLocality, true, false, apiVersion ) );
+}
+
+Database Database::createDatabase( std::string connFileName, int apiVersion, LocalityData const& clientLocality ) {
+	Reference<ClusterConnectionFile> rccf = Reference<ClusterConnectionFile>(new ClusterConnectionFile(ClusterConnectionFile::lookupClusterFileName(connFileName).first));
+	return Database::createDatabase(rccf, apiVersion, clientLocality);
+}
+
 extern uint32_t determinePublicIPAutomatically( ClusterConnectionString const& ccs );
 
-Cluster::Cluster( Reference<ClusterConnectionFile> connFile, int apiVersion )
-	: clusterInterface( new AsyncVar<Optional<ClusterInterface>> ), apiVersion(apiVersion), connectionFile( connFile )
+Cluster::Cluster( Reference<ClusterConnectionFile> connFile, int apiVersion ) 
+	: clusterInterface(new AsyncVar<Optional<ClusterInterface>>())
 {
+	init(connFile, true, apiVersion);
+}
+
+Cluster::Cluster( Reference<ClusterConnectionFile> connFile, Reference<AsyncVar<Optional<ClusterInterface>>> clusterInterface) 
+	: clusterInterface(clusterInterface)
+{
+	init(connFile, true);
+}
+
+void Cluster::init( Reference<ClusterConnectionFile> connFile, bool startClientInfoMonitor, int apiVersion ) {
+	connectionFile = connFile;
+	connected = clusterInterface->onChange();
+
 	if(!g_network)
 		throw network_not_setup();
 
-	if(networkOptions.traceDirectory.present() && !traceFileIsOpen()) {
-		g_network->initMetrics();
-		FlowTransport::transport().initMetrics();
-		initTraceEventMetrics();
+	if(connFile) {
+		if(networkOptions.traceDirectory.present() && !traceFileIsOpen()) {
+			g_network->initMetrics();
+			FlowTransport::transport().initMetrics();
+			initTraceEventMetrics();
 
-		auto publicIP = determinePublicIPAutomatically( connFile->getConnectionString() );
-		openTraceFile(NetworkAddress(publicIP, ::getpid()), networkOptions.traceRollSize, networkOptions.traceMaxLogsSize, networkOptions.traceDirectory.get(), "trace", networkOptions.traceLogGroup);
+			auto publicIP = determinePublicIPAutomatically( connFile->getConnectionString() );
+			openTraceFile(NetworkAddress(publicIP, ::getpid()), networkOptions.traceRollSize, networkOptions.traceMaxLogsSize, networkOptions.traceDirectory.get(), "trace", networkOptions.traceLogGroup);
 
-		TraceEvent("ClientStart")
-			.detail("SourceVersion", getHGVersion())
-			.detail("Version", FDB_VT_VERSION)
-			.detail("PackageName", FDB_VT_PACKAGE_NAME)
-			.detail("ClusterFile", connFile->getFilename().c_str())
-			.detail("ConnectionString", connFile->getConnectionString().toString())
-			.detailf("ActualTime", "%lld", DEBUG_DETERMINISM ? 0 : time(NULL))
-			.detail("ApiVersion", apiVersion)
-			.detailf("ImageOffset", "%p", platform::getImageOffset())
-			.trackLatest("ClientStart");
+			TraceEvent("ClientStart")
+				.detail("SourceVersion", getHGVersion())
+				.detail("Version", FDB_VT_VERSION)
+				.detail("PackageName", FDB_VT_PACKAGE_NAME)
+				.detail("ClusterFile", connFile->getFilename().c_str())
+				.detail("ConnectionString", connFile->getConnectionString().toString())
+				.detailf("ActualTime", "%lld", DEBUG_DETERMINISM ? 0 : time(NULL))
+				.detail("ApiVersion", apiVersion)
+				.detailf("ImageOffset", "%p", platform::getImageOffset())
+				.trackLatest("ClientStart");
 
-		initializeSystemMonitorMachineState(SystemMonitorMachineState(publicIP));
+			initializeSystemMonitorMachineState(SystemMonitorMachineState(publicIP));
 
-		systemMonitor();
-		uncancellable( recurring( &systemMonitor, CLIENT_KNOBS->SYSTEM_MONITOR_INTERVAL, TaskFlushTrace ) );
+			systemMonitor();
+			uncancellable( recurring( &systemMonitor, CLIENT_KNOBS->SYSTEM_MONITOR_INTERVAL, TaskFlushTrace ) );
+		}
+
+		leaderMon = monitorLeader( connFile, clusterInterface );
+		failMon = failureMonitorClient( clusterInterface, false );
 	}
-
-	leaderMon = monitorLeader( connectionFile, clusterInterface );
-	failMon = failureMonitorClient( clusterInterface, false );
-	connected = clusterInterface->onChange(); // SOMEDAY: This is a hack
 }
 
 Cluster::~Cluster() {}
 
-Reference<Cluster> Cluster::createCluster( Reference<ClusterConnectionFile> connFile, int apiVersion ) {
-	return Reference<Cluster>( new Cluster( connFile, apiVersion ) );
-}
-
-Reference<Cluster> Cluster::createCluster(std::string connFileName, int apiVersion) {
-	Reference<ClusterConnectionFile> rccf = Reference<ClusterConnectionFile>(new ClusterConnectionFile(ClusterConnectionFile::lookupClusterFileName(connFileName).first));
-	return Reference<Cluster>(new Cluster( rccf, apiVersion));
-}
-
-Future<Database> Cluster::createDatabase( LocalityData locality ) {
-	return DatabaseContext::createDatabase( clusterInterface, Reference<Cluster>::addRef( this ), locality );
+Reference<AsyncVar<Optional<struct ClusterInterface>>> Cluster::getClusterInterface() {
+	return clusterInterface;
 }
 
 Future<Void> Cluster::onConnected() {
 	return connected;
 }
-
-void Cluster::setOption(FDBClusterOptions::Option option, Optional<StringRef> value) { }
 
 void setNetworkOption(FDBNetworkOptions::Option option, Optional<StringRef> value) {
 	switch(option) {
@@ -919,7 +964,7 @@ Reference<ProxyInfo> DatabaseContext::getMasterProxies() {
 	return masterProxies;
 }
 
-//Actor which will wait until the ProxyInfo returned by the DatabaseContext cx is not NULL
+//Actor which will wait until the MultiInterface<MasterProxyInterface> returned by the DatabaseContext cx is not NULL
 ACTOR Future<Reference<ProxyInfo>> getMasterProxiesFuture(DatabaseContext *cx) {
 	loop{
 		Reference<ProxyInfo> proxies = cx->getMasterProxies();
@@ -2211,13 +2256,8 @@ void Transaction::fullReset() {
 }
 
 int Transaction::apiVersionAtLeast(int minVersion) const {
-	if(cx->cluster)
-		return cx->cluster->apiVersionAtLeast(minVersion);
-
-	return true;
+	return cx->apiVersionAtLeast(minVersion);
 }
-
-
 
 class MutationBlock {
 public:
@@ -2911,31 +2951,21 @@ ACTOR Future< StorageMetrics > waitStorageMetrics(
 	StorageMetrics permittedError,
 	int shardLimit )
 {
-	state int tooManyShardsCount = 0;
 	loop {
-		state vector< pair<KeyRange, Reference<LocationInfo>> > locations = wait( getKeyRangeLocations( cx, keys, shardLimit, false, &StorageServerInterface::waitMetrics, TransactionInfo(TaskDataDistribution) ) );
+		vector< pair<KeyRange, Reference<LocationInfo>> > locations = wait( getKeyRangeLocations( cx, keys, shardLimit, false, &StorageServerInterface::waitMetrics, TransactionInfo(TaskDataDistribution) ) );
 
-		if( locations.size() == shardLimit ) {
-			TraceEvent(!g_network->isSimulated() && ++tooManyShardsCount >= 15 ? SevWarnAlways : SevWarn, "WaitStorageMetricsPenalty")
-				.detail("Keys", printable(keys))
-				.detail("Locations", locations.size())
-				.detail("Limit", CLIENT_KNOBS->STORAGE_METRICS_SHARD_LIMIT)
-				.detail("JitteredSecondsOfPenitence", CLIENT_KNOBS->STORAGE_METRICS_TOO_MANY_SHARDS_DELAY);
-			wait(delayJittered(CLIENT_KNOBS->STORAGE_METRICS_TOO_MANY_SHARDS_DELAY, TaskDataDistribution));
-			// make sure that the next getKeyRangeLocations() call will actually re-fetch the range
-			cx->invalidateCache( keys );
-		} else {
-			tooManyShardsCount = 0;
-			//SOMEDAY: Right now, if there are too many shards we delay and check again later. There may be a better solution to this.
+		//SOMEDAY: Right now, if there are too many shards we delay and check again later. There may be a better solution to this.
+		if(locations.size() < shardLimit) {
 			try {
+				Future<StorageMetrics> fx;
 				if (locations.size() > 1) {
-					StorageMetrics x = wait( waitStorageMetricsMultipleLocations( locations, min, max, permittedError ) );
-					return x;
+					fx = waitStorageMetricsMultipleLocations( locations, min, max, permittedError );
 				} else {
 					WaitMetricsRequest req( keys, min, max );
-					StorageMetrics x = wait( loadBalance( locations[0].second, &StorageServerInterface::waitMetrics, req, TaskDataDistribution ) );
-					return x;
+					fx = loadBalance( locations[0].second, &StorageServerInterface::waitMetrics, req, TaskDataDistribution );
 				}
+				StorageMetrics x = wait(fx);
+				return x;
 			} catch (Error& e) {
 				if (e.code() != error_code_wrong_shard_server && e.code() != error_code_all_alternatives_failed) {
 					TraceEvent(SevError, "WaitStorageMetricsError").error(e);
@@ -2944,6 +2974,14 @@ ACTOR Future< StorageMetrics > waitStorageMetrics(
 				cx->invalidateCache(keys);
 				wait(delay(CLIENT_KNOBS->WRONG_SHARD_SERVER_DELAY, TaskDataDistribution));
 			}
+		} else {
+			TraceEvent(SevWarn, "WaitStorageMetricsPenalty")
+				.detail("Keys", printable(keys))
+				.detail("Limit", CLIENT_KNOBS->STORAGE_METRICS_SHARD_LIMIT)
+				.detail("JitteredSecondsOfPenitence", CLIENT_KNOBS->STORAGE_METRICS_TOO_MANY_SHARDS_DELAY);
+			wait(delayJittered(CLIENT_KNOBS->STORAGE_METRICS_TOO_MANY_SHARDS_DELAY, TaskDataDistribution));
+			// make sure that the next getKeyRangeLocations() call will actually re-fetch the range
+			cx->invalidateCache( keys );
 		}
 	}
 }

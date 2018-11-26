@@ -20,7 +20,7 @@
 
 #include "fdbclient/NativeAPI.h"
 #include "fdbserver/TesterInterface.h"
-#include "workloads.h"
+#include "fdbserver/workloads/workloads.h"
 #include "fdbclient/StatusClient.h"
 #include "flow/UnitTest.h"
 #include "fdbclient/Schemas.h"
@@ -43,8 +43,7 @@ struct StatusWorkload : TestWorkload {
 		requestsPerSecond = getOption(options, LiteralStringRef("requestsPerSecond"), 0.5);
 		auto statusSchemaStr = getOption(options, LiteralStringRef("schema"), JSONSchemas::statusSchema);
 		if (statusSchemaStr.size()) {
-			json_spirit::mValue schema;
-			json_spirit::read_string( statusSchemaStr.toString(), schema );
+			json_spirit::mValue schema = readJSONStrictly(statusSchemaStr.toString());
 			parsedSchema = schema.get_obj();
 
 			// This is sort of a hack, but generate code coverage *requirements* for everything in schema
@@ -61,12 +60,8 @@ struct StatusWorkload : TestWorkload {
 	virtual Future<Void> start(Database const& cx) {
 		if (clientId != 0)
 			return Void();
-		Reference<Cluster> cluster = cx->cluster;
-		if (!cluster) {
-			TraceEvent(SevError, "StatusWorkloadStartError").detail("Reason", "NULL cluster");
-			return Void();
-		}
-		return success(timeout(fetcher(cluster->getConnectionFile(), this), testDuration));
+
+		return success(timeout(fetcher(cx->getConnectionFile(), this), testDuration));
 	}
 	virtual Future<bool> check(Database const& cx) {
 		return errors.getValue() == 0;
@@ -141,13 +136,10 @@ struct StatusWorkload : TestWorkload {
 
 WorkloadFactory<StatusWorkload> StatusWorkloadFactory("Status");
 
-TEST_CASE("fdbserver/status/schema/basic") {
-	json_spirit::mValue schema;
-	json_spirit::read_string( std::string("{\"apple\":3,\"banana\":\"foo\",\"sub\":{\"thing\":true},\"arr\":[{\"a\":1,\"b\":2}],\"en\":{\"$enum\":[\"foo\",\"bar\"]},\"mapped\":{\"$map\":{\"x\":true}}"), schema );
-
+TEST_CASE("/fdbserver/status/schema/basic") {
+	json_spirit::mValue schema = readJSONStrictly("{\"apple\":3,\"banana\":\"foo\",\"sub\":{\"thing\":true},\"arr\":[{\"a\":1,\"b\":2}],\"en\":{\"$enum\":[\"foo\",\"bar\"]},\"mapped\":{\"$map\":{\"x\":true}}}");
 	auto check = [&schema](bool expect_ok, std::string t) {
-		json_spirit::mValue test;
-		json_spirit::read_string( t, test );
+		json_spirit::mValue test = readJSONStrictly(t);
 		TraceEvent("SchemaMatch").detail("Schema", json_spirit::write_string(schema)).detail("Value", json_spirit::write_string(test)).detail("Expect", expect_ok);
 		std::string errorStr;
 		ASSERT( expect_ok == schemaMatch(schema.get_obj(), test.get_obj(), errorStr, expect_ok ? SevError : SevInfo, true) );

@@ -25,15 +25,15 @@
 #include "fdbclient/ClusterInterface.h"
 #include "fdbclient/NativeAPI.h"
 #include "fdbclient/SystemData.h"
-#include "TesterInterface.h"
-#include "WorkerInterface.h"
-#include "ClusterRecruitmentInterface.h"
-#include "workloads/workloads.h"
-#include "Status.h"
-#include "QuietDatabase.h"
+#include "fdbserver/TesterInterface.h"
+#include "fdbserver/WorkerInterface.h"
+#include "fdbserver/ClusterRecruitmentInterface.h"
+#include "fdbserver/workloads/workloads.h"
+#include "fdbserver/Status.h"
+#include "fdbserver/QuietDatabase.h"
 #include "fdbclient/MonitorLeader.h"
 #include "fdbclient/FailureMonitorClient.h"
-#include "CoordinationInterface.h"
+#include "fdbserver/CoordinationInterface.h"
 #include "fdbclient/ManagementAPI.h"
 #include "flow/actorcompiler.h"  // This must be the last #include.
 
@@ -497,10 +497,7 @@ ACTOR Future<Void> testerServerWorkload( WorkloadRequest work, Reference<Cluster
 		startRole(Role::TESTER, workIface.id(), UID(), details);
 
 		if( work.useDatabase ) {
-			Reference<Cluster> cluster = Cluster::createCluster(ccf->getFilename(), -1);
-			Database _cx = wait(cluster->createDatabase(locality));
-			cx = _cx;
-
+			cx = Database::createDatabase(ccf, -1, locality);
 			wait( delay(1.0) );
 		}
 
@@ -954,6 +951,8 @@ vector<TestSpec> readTests( ifstream& ifs ) {
 			TraceEvent("TestParserTest").detail("ParsedExtraDB", "");
 		} else if( attrib == "minimumReplication" ) {
 			TraceEvent("TestParserTest").detail("ParsedMinimumReplication", "");
+		} else if( attrib == "minimumRegions" ) {
+			TraceEvent("TestParserTest").detail("ParsedMinimumRegions", "");
 		} else if( attrib == "buggify" ) {
 			TraceEvent("TestParserTest").detail("ParsedBuggify", "");
 		} else if( attrib == "checkOnly" ) {
@@ -1028,8 +1027,7 @@ ACTOR Future<Void> runTests( Reference<AsyncVar<Optional<struct ClusterControlle
 		databasePingDelay = 0.0;
 	
 	if (useDB) {
-		Database _cx = wait( DatabaseContext::createDatabase( ci, Reference<Cluster>(), locality ) );
-		cx = _cx;
+		cx = DatabaseContext::create(ci, Reference<ClusterConnectionFile>(), locality);
 	}
 
 	state Future<Void> disabler = disableConnectionFailuresAfter(450, "Tester");
